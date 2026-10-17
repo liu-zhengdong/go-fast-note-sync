@@ -30,20 +30,20 @@ The table lists combinations covered by the project's retained live smoke suite.
 | `v1.1.x` | Official client `2.4.0` | `3.6.0` | 17–20-case live smoke suite (`v1.1.0`–`v1.1.3`) |
 | `v1.0.0` | Client `2.0.15` generation | Not pinned in historical records | 14-case live smoke suite; no explicit server-version claim |
 
-For new deployments, use the latest `v1.1.x` release (`v1.1.3`) with service `3.6.0`.
+For new deployments, use the latest `v1.1.x` release (`v1.1.4`) with service `3.6.x` (this fork tracks service `3.6.6`).
 
 ## Installation
 
 ### From GitHub Release (recommended)
 
-Download the pre-built binary for your platform from the [GitHub Releases page](https://github.com/erichll/go-fast-note-sync/releases). Each release includes platform archives and a `checksums.txt` for verification.
+Download the pre-built binary for your platform from the [GitHub Releases page](https://github.com/liu-zhengdong/go-fast-note-sync/releases). Each release includes platform archives and a `checksums.txt` for verification.
 
 **Linux x86-64 example:**
 
 ```bash
-VERSION=v1.1.3
-curl -LO "https://github.com/erichll/go-fast-note-sync/releases/download/${VERSION}/go-fast-note-sync_linux_amd64.tar.gz"
-curl -LO "https://github.com/erichll/go-fast-note-sync/releases/download/${VERSION}/checksums.txt"
+VERSION=v1.1.4
+curl -LO "https://github.com/liu-zhengdong/go-fast-note-sync/releases/download/${VERSION}/go-fast-note-sync_linux_amd64.tar.gz"
+curl -LO "https://github.com/liu-zhengdong/go-fast-note-sync/releases/download/${VERSION}/checksums.txt"
 tar -xzf go-fast-note-sync_linux_amd64.tar.gz
 install -m 755 go-fast-note-sync ~/.local/bin/go-fast-note-sync
 ```
@@ -60,10 +60,10 @@ sha256sum -c checksums.txt --ignore-missing
 ### From Docker (GHCR)
 
 ```bash
-docker pull ghcr.io/erichll/go-fast-note-sync:latest
+docker pull ghcr.io/liu-zhengdong/go-fast-note-sync:latest
 ```
 
-The GHCR package is public — no `docker login` required. Replace `latest` with a specific tag (e.g. `v1.1.3`) for pinned deployments.
+The GHCR package is public — no `docker login` required. Replace `latest` with a specific tag (e.g. `v1.1.4`) for pinned deployments.
 
 > **Architecture:** published images are **linux/amd64 only**. Release archives additionally cover linux/arm64, darwin/amd64, darwin/arm64, and windows/amd64. On other architectures, build the image locally (see **[deploy/docker/README.md](deploy/docker/README.md)**).
 
@@ -72,7 +72,7 @@ See **[deploy/docker/README.md](deploy/docker/README.md)** for the full operator
 ### From source
 
 ```bash
-git clone https://github.com/erichll/go-fast-note-sync.git
+git clone https://github.com/liu-zhengdong/go-fast-note-sync.git
 cd go-fast-note-sync
 go build -o ~/.local/bin/go-fast-note-sync ./cmd
 ```

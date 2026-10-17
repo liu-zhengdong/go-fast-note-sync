@@ -128,7 +128,7 @@ jobs:
       - name: verify anonymous GHCR pull
         run: |
           docker logout ghcr.io || true
-          IMAGE="ghcr.io/erichll/go-fast-note-sync"
+          IMAGE="ghcr.io/liu-zhengdong/go-fast-note-sync"
           for TAG in "${GITHUB_REF_NAME}" latest; do
             for ATTEMPT in 1 2 3 4 5 6; do
               if docker pull "${IMAGE}:${TAG}"; then

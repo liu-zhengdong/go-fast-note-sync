@@ -140,7 +140,13 @@ func (s *SyncService) handleSync(isLoadLastTime bool) {
 	s.configSyncTasks = SyncTaskCounter{}
 	s.folderSyncTasks = SyncTaskCounter{}
 	s.syncPages = make(map[string]*syncPageTracker)
+	s.isSyncRequesting = false
 	s.mu.Unlock()
+
+	// The idle watchdog covers the scan, not only the wait for *SyncEnd.
+	// A vault walk that blocks on one file otherwise leaves isSyncing set
+	// with no goroutine able to clear it.
+	go s.runCheckSyncCompletion(roundID, isLoadLastTime)
 
 	go func() {
 		result, err := s.scanVault(isLoadLastTime)
@@ -152,8 +158,15 @@ func (s *SyncService) handleSync(isLoadLastTime bool) {
 		if !s.ownsSyncRound(roundID) {
 			return
 		}
+		if s.beforeCommitScan != nil {
+			s.beforeCommitScan(roundID)
+		}
 
 		s.mu.Lock()
+		if s.syncRoundID != roundID || !s.isSyncing {
+			s.mu.Unlock()
+			return
+		}
 		s.scannedNoteHashes = result.scannedNoteHashes
 		s.scannedFileHashes = result.scannedFileHashes
 		s.scannedConfigHashes = result.scannedConfigHashes
@@ -163,16 +176,34 @@ func (s *SyncService) handleSync(isLoadLastTime bool) {
 		context := newUUID()
 		s.sendSyncRequests(roundID, result, context, isLoadLastTime)
 
-		if !s.ownsSyncRound(roundID) {
+		s.mu.Lock()
+		if s.syncRoundID != roundID || !s.isSyncing {
+			s.mu.Unlock()
 			return
 		}
-
-		s.mu.Lock()
 		s.isSyncRequesting = false
 		s.mu.Unlock()
-
-		go s.runCheckSyncCompletion(roundID, isLoadLastTime)
 	}()
+}
+
+// abandonActiveSync drops the in-flight round so a later handleSync is not
+// refused. It must be called with s.mu held.
+func (s *SyncService) abandonActiveSyncLocked(reason string) {
+	active := s.isSyncing || s.isSyncRequesting
+	s.isSyncing = false
+	s.isSyncRequesting = false
+	s.syncRoundID++
+	s.syncRoundConn = nil
+	if active {
+		log.Printf("[sync] reset syncing state (%s)", reason)
+	}
+}
+
+// abandonActiveSync is the unlocked form used by tests and shutdown.
+func (s *SyncService) abandonActiveSync(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.abandonActiveSyncLocked(reason)
 }
 
 // sendSyncRequests sends FolderSync first, waits for folderSyncDone, then Note/File/Setting.
@@ -379,7 +410,7 @@ func (s *SyncService) folderSyncDone() bool {
 func (s *SyncService) runCheckSyncCompletion(roundID uint64, wasInitSync bool) {
 	timeout := s.syncTimeout
 	if timeout == 0 {
-		timeout = 30 * time.Second
+		timeout = defaultSyncIdleTimeout
 	}
 	lastProgress := s.syncProgressSnapshot()
 	lastProgressAt := time.Now()
@@ -455,6 +486,7 @@ type syncProgress struct {
 	downloads      int
 	receivedChunks int
 	uploads        int
+	activity       uint64
 }
 
 func (s *SyncService) syncProgressSnapshot() syncProgress {
@@ -465,6 +497,7 @@ func (s *SyncService) syncProgressSnapshot() syncProgress {
 		endFlags:  [4]bool{s.noteSyncEnd, s.fileSyncEnd, s.configSyncEnd, s.folderSyncEnd},
 		downloads: len(s.fileDownloadSessions),
 		uploads:   len(s.activeUploads),
+		activity:  s.syncActivity.Load(),
 	}
 	for _, tracker := range s.syncPages {
 		progress.pageCount += len(tracker.Pages)
@@ -480,7 +513,7 @@ func (s *SyncService) syncProgressSnapshot() syncProgress {
 
 // isSyncComplete returns true when all sync modules have finished.
 // Completion requires *SyncEnd to arrive because SyncEnd handlers commit sync timestamps,
-// clear pending-delete hashes, and update scanned caches. The 30s timeout in
+// clear pending-delete hashes, and update scanned caches. The idle timeout in
 // runCheckSyncCompletion acts as the safety net when SyncEnd is lost.
 func (s *SyncService) isSyncComplete() bool {
 	s.mu.Lock()
@@ -631,6 +664,9 @@ func (s *SyncService) scanVault(isLoadLastTime bool) (*scanResult, error) {
 		if relPath == "." {
 			return nil
 		}
+		// Counting visited paths is what keeps a long full scan (thousands of
+		// notes) from looking idle to the round watchdog.
+		s.syncActivity.Add(1)
 
 		// Skip .obsidian entirely — handled separately by scanConfigs.
 		if d.IsDir() && relPath == obsidianConfigDir {
@@ -833,6 +869,7 @@ func (s *SyncService) scanConfigs(vaultPath string, configHashMap map[string]sta
 	}
 
 	addConfig := func(absPath, relPath string) {
+		s.syncActivity.Add(1)
 		if !s.isConfigSyncPathAllowed(relPath) {
 			return
 		}

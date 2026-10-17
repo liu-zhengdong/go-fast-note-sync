@@ -122,6 +122,7 @@ func TestStartHappyPath(t *testing.T) {
 
 type fakeDaemon struct {
 	connected  bool
+	closed     bool
 	syncDoneCh chan struct{}
 	syncErr    error
 }
@@ -160,6 +161,11 @@ func (f *fakeDaemon) HandleLocalRename(local.RenameEvent) local.Result {
 func (f *fakeDaemon) HandleWatchOverflow() {}
 
 func (f *fakeDaemon) SetDebugDisconnectAfter(time.Duration) {}
+
+func (f *fakeDaemon) Close() error {
+	f.closed = true
+	return nil
+}
 
 type fakeLocalWatcher struct {
 	closed bool

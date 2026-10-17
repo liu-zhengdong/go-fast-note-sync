@@ -30,20 +30,20 @@
 | `v1.1.x` | 官方客户端 `2.4.0` | `3.6.0` | 17–20-case 真实服务 smoke（`v1.1.0`–`v1.1.3`） |
 | `v1.0.0` | 客户端 `2.0.15` 代际协议 | 历史记录未固定版本 | 14-case 真实服务 smoke；不声明明确服务端版本 |
 
-新部署推荐使用最新的 `v1.1.x` 版本（`v1.1.3`）搭配服务端 `3.6.0`。
+新部署推荐使用最新的 `v1.1.x` 版本（`v1.1.4`）搭配服务端 `3.6.x`（本 fork 对应服务端 `3.6.6`）。
 
 ## 安装
 
 ### 从 GitHub Release 下载（推荐）
 
-在 [GitHub Releases 页面](https://github.com/erichll/go-fast-note-sync/releases) 下载对应平台的预编译二进制。每个 Release 包含各平台归档包和用于校验的 `checksums.txt`。
+在 [GitHub Releases 页面](https://github.com/liu-zhengdong/go-fast-note-sync/releases) 下载对应平台的预编译二进制。每个 Release 包含各平台归档包和用于校验的 `checksums.txt`。
 
 **Linux x86-64 示例：**
 
 ```bash
-VERSION=v1.1.3
-curl -LO "https://github.com/erichll/go-fast-note-sync/releases/download/${VERSION}/go-fast-note-sync_linux_amd64.tar.gz"
-curl -LO "https://github.com/erichll/go-fast-note-sync/releases/download/${VERSION}/checksums.txt"
+VERSION=v1.1.4
+curl -LO "https://github.com/liu-zhengdong/go-fast-note-sync/releases/download/${VERSION}/go-fast-note-sync_linux_amd64.tar.gz"
+curl -LO "https://github.com/liu-zhengdong/go-fast-note-sync/releases/download/${VERSION}/checksums.txt"
 tar -xzf go-fast-note-sync_linux_amd64.tar.gz
 install -m 755 go-fast-note-sync ~/.local/bin/go-fast-note-sync
 ```
@@ -60,10 +60,10 @@ sha256sum -c checksums.txt --ignore-missing
 ### 通过 Docker（GHCR）
 
 ```bash
-docker pull ghcr.io/erichll/go-fast-note-sync:latest
+docker pull ghcr.io/liu-zhengdong/go-fast-note-sync:latest
 ```
 
-GHCR 镜像已设为公开，无需 `docker login`。将 `latest` 替换为具体版本标签（如 `v1.1.3`）可固定版本。
+GHCR 镜像已设为公开，无需 `docker login`。将 `latest` 替换为具体版本标签（如 `v1.1.4`）可固定版本。
 
 > **架构说明：** 已发布镜像仅为 **linux/amd64**。发布归档额外覆盖 linux/arm64、darwin/amd64、darwin/arm64 和 windows/amd64。其他架构请参考 **[deploy/docker/README.md](deploy/docker/README.md)** 自行构建镜像。
 
@@ -72,7 +72,7 @@ GHCR 镜像已设为公开，无需 `docker login`。将 `latest` 替换为具�
 ### 从源码编译
 
 ```bash
-git clone https://github.com/erichll/go-fast-note-sync.git
+git clone https://github.com/liu-zhengdong/go-fast-note-sync.git
 cd go-fast-note-sync
 go build -o ~/.local/bin/go-fast-note-sync ./cmd
 ```

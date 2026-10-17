@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/erichll/go-fast-note-sync/internal/config"
@@ -17,12 +18,19 @@ import (
 
 const echoSuppressDelay = 500 * time.Millisecond
 
+// pathLockTimeout stops a second writer from waiting forever when the holder
+// is stuck. Returning a no-op unlock lets the caller finish (and shutdown
+// proceed) instead of pinning the read loop or the watcher.
+const pathLockTimeout = 30 * time.Second
+
 // ConcurrencyManager limits local upload-style operations and provides one FIFO
 // lane for rename operations whose Ack does not carry a path.
 type ConcurrencyManager struct {
-	enabled bool
-	slots   chan struct{}
-	fifo    chan struct{}
+	enabled  bool
+	slots    chan struct{}
+	fifo     chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 func NewConcurrencyManager(cfg *config.Config) *ConcurrencyManager {
@@ -39,18 +47,37 @@ func NewConcurrencyManager(cfg *config.Config) *ConcurrencyManager {
 		enabled: enabled,
 		slots:   make(chan struct{}, max),
 		fifo:    make(chan struct{}, 1),
+		stop:    make(chan struct{}),
 	}
 }
 
-func (m *ConcurrencyManager) WaitForSlot(_ string, fifo bool, _ int) {
+// Stop unblocks every WaitForSlot. Used on process shutdown.
+func (m *ConcurrencyManager) Stop() {
+	if m == nil {
+		return
+	}
+	m.stopOnce.Do(func() { close(m.stop) })
+}
+
+func (m *ConcurrencyManager) WaitForSlot(_ string, fifo bool, _ int) bool {
 	if m == nil || !m.enabled {
-		return
+		return true
 	}
+	ch := m.slots
 	if fifo {
-		m.fifo <- struct{}{}
-		return
+		ch = m.fifo
 	}
-	m.slots <- struct{}{}
+	timer := time.NewTimer(slotAcquireTimeout)
+	defer timer.Stop()
+	select {
+	case ch <- struct{}{}:
+		return true
+	case <-timer.C:
+		log.Printf("[sync] concurrency slot acquire timed out after %v", slotAcquireTimeout)
+		return false
+	case <-m.stop:
+		return false
+	}
 }
 
 func (m *ConcurrencyManager) ReleaseSlot(_ string) {
@@ -240,26 +267,32 @@ func isLocalStorageSettingPath(raw string) bool {
 }
 
 func (s *SyncService) lockPath(key string) func() {
-	const attempts = 10
-	const delay = 50 * time.Millisecond
 	s.mu.Lock()
 	ch := s.pathLocks[key]
 	if ch == nil {
 		ch = make(chan struct{}, 1)
 		s.pathLocks[key] = ch
 	}
+	stop := s.stopCh
 	s.mu.Unlock()
 
-	for i := 0; i < attempts; i++ {
+	timer := time.NewTimer(pathLockTimeout)
+	defer timer.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
 		select {
 		case ch <- struct{}{}:
 			return func() { <-ch }
-		default:
-			time.Sleep(delay)
+		case <-stop:
+			log.Printf("[sync] path lock %q interrupted by shutdown", key)
+			return func() {}
+		case <-timer.C:
+			log.Printf("[sync] path lock %q timed out after %v", key, pathLockTimeout)
+			return func() {}
+		case <-tick.C:
 		}
 	}
-	ch <- struct{}{}
-	return func() { <-ch }
 }
 
 func (s *SyncService) addIgnoredFile(rel string) {
@@ -582,7 +615,9 @@ func (s *SyncService) sendFileContentModify(action string, rp resolvedPath, pend
 		}
 		s.mu.Unlock()
 	}
-	s.concurrency.WaitForSlot(rp.Rel, false, 0)
+	if !s.concurrency.WaitForSlot(rp.Rel, false, 0) {
+		return fmt.Errorf("concurrency slot unavailable for %s", rp.Rel)
+	}
 	if err := s.Send(action, payload); err != nil {
 		s.concurrency.ReleaseSlot(rp.Rel)
 		return err
@@ -625,7 +660,9 @@ func (s *SyncService) sendRename(action, oldRaw, newRaw string, pending func(str
 		"path":        newRP.Rel,
 		"pathHash":    h.Path(newRP.Rel),
 	}
-	s.concurrency.WaitForSlot(newRP.Rel, true, 0)
+	if !s.concurrency.WaitForSlot(newRP.Rel, true, 0) {
+		return fmt.Errorf("concurrency slot unavailable for %s", newRP.Rel)
+	}
 	if err := s.Send(action, payload); err != nil {
 		s.concurrency.ReleaseFifoSlot()
 		return err
@@ -640,7 +677,9 @@ func (s *SyncService) SendNoteDelete(raw string) error {
 	if err != nil {
 		return err
 	}
-	s.concurrency.WaitForSlot(rp.Rel, false, 0)
+	if !s.concurrency.WaitForSlot(rp.Rel, false, 0) {
+		return fmt.Errorf("concurrency slot unavailable for %s", rp.Rel)
+	}
 	if err := s.Send("NoteDelete", map[string]interface{}{"vault": s.cfg.Vault, "path": rp.Rel, "pathHash": h.Path(rp.Rel)}); err != nil {
 		s.concurrency.ReleaseSlot(rp.Rel)
 		return err
@@ -657,7 +696,9 @@ func (s *SyncService) SendFileDelete(raw string) error {
 		return err
 	}
 	s.cancelUpload(rp.Rel)
-	s.concurrency.WaitForSlot(rp.Rel, false, 0)
+	if !s.concurrency.WaitForSlot(rp.Rel, false, 0) {
+		return fmt.Errorf("concurrency slot unavailable for %s", rp.Rel)
+	}
 	if err := s.Send("FileDelete", map[string]interface{}{"vault": s.cfg.Vault, "path": rp.Rel, "pathHash": h.Path(rp.Rel)}); err != nil {
 		s.concurrency.ReleaseSlot(rp.Rel)
 		return err
@@ -676,7 +717,9 @@ func (s *SyncService) SendSettingDelete(raw string) error {
 	if !s.isConfigSyncPathAllowed(rp.Rel) {
 		return fmt.Errorf("setting path outside sync scope: %s", rp.Rel)
 	}
-	s.concurrency.WaitForSlot(rp.Rel, false, 0)
+	if !s.concurrency.WaitForSlot(rp.Rel, false, 0) {
+		return fmt.Errorf("concurrency slot unavailable for %s", rp.Rel)
+	}
 	if err := s.Send("SettingDelete", map[string]interface{}{"vault": s.cfg.Vault, "path": rp.Rel, "pathHash": h.Path(rp.Rel)}); err != nil {
 		s.concurrency.ReleaseSlot(rp.Rel)
 		return err
