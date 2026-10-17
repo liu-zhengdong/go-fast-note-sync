@@ -1514,8 +1514,8 @@ func TestScheduleReconnect_MaxAttemptsKeepsRetrying(t *testing.T) {
 
 	svc.scheduleReconnect()
 
-	if sleptFor != reconnectMaxDelay {
-		t.Errorf("sleep duration = %v, want capped %v", sleptFor, reconnectMaxDelay)
+	if !withinJitter(sleptFor, reconnectMaxDelay) {
+		t.Errorf("sleep duration = %v, want capped %v (+jitter)", sleptFor, reconnectMaxDelay)
 	}
 	if svc.timeConnect != reconnectMaxAttempts {
 		t.Errorf("timeConnect = %d, want capped %d", svc.timeConnect, reconnectMaxAttempts)
@@ -1535,7 +1535,7 @@ func TestScheduleReconnect_CallsSleepWithCorrectDelay(t *testing.T) {
 	if svc.timeConnect != 1 {
 		t.Errorf("timeConnect = %d, want 1", svc.timeConnect)
 	}
-	if sleptFor != reconnectDelay(1) {
+	if !withinJitter(sleptFor, reconnectDelay(1)) {
 		t.Errorf("sleep duration = %v, want %v", sleptFor, reconnectDelay(1))
 	}
 }
@@ -1550,7 +1550,7 @@ func TestScheduleReconnect_SecondAttemptDelay(t *testing.T) {
 
 	svc.scheduleReconnect()
 
-	if sleptFor != reconnectDelay(2) {
+	if !withinJitter(sleptFor, reconnectDelay(2)) {
 		t.Errorf("sleep duration = %v, want %v", sleptFor, reconnectDelay(2))
 	}
 }
@@ -1562,8 +1562,9 @@ func TestReconnectDelay_UpstreamPatternAndCap(t *testing.T) {
 		3:  1 * time.Second,
 		4:  2 * time.Second,
 		5:  4 * time.Second,
-		14: 30 * time.Minute,
-		15: 30 * time.Minute,
+		10: 60 * time.Second,
+		14: 60 * time.Second,
+		15: 60 * time.Second,
 	}
 	for attempt, delay := range want {
 		if got := reconnectDelay(attempt); got != delay {
@@ -1888,5 +1889,20 @@ func TestSendBlockedWriteReturnsAtDeadline(t *testing.T) {
 	}
 	if elapsed < writeWait || elapsed > time.Second {
 		t.Fatalf("Send returned after %v, want between %v and 1s", elapsed, writeWait)
+	}
+}
+
+func withinJitter(got, base time.Duration) bool {
+	return got >= base && got <= base+base/4
+}
+
+func TestWithJitterBounds(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		if d := withJitter(4 * time.Second); !withinJitter(d, 4*time.Second) {
+			t.Fatalf("withJitter out of range: %v", d)
+		}
+	}
+	if withJitter(0) != 0 {
+		t.Fatal("withJitter(0) should be 0")
 	}
 }

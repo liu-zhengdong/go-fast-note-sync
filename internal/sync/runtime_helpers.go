@@ -344,6 +344,25 @@ func (s *SyncService) updateSyncTime(module string, lastTime int64) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.isSyncing {
+		s.holdRoundSyncTimeLocked(module, lastTime)
+		return
+	}
+	s.applySyncTimeLocked(module, lastTime)
+}
+
+// holdRoundSyncTimeLocked records lastTime for the in-flight round. Caller holds s.mu.
+func (s *SyncService) holdRoundSyncTimeLocked(module string, lastTime int64) {
+	if s.roundSyncTimes == nil {
+		s.roundSyncTimes = make(map[string]int64)
+	}
+	if lastTime > s.roundSyncTimes[module] {
+		s.roundSyncTimes[module] = lastTime
+	}
+}
+
+// applySyncTimeLocked advances the persisted lastTime. Caller holds s.mu.
+func (s *SyncService) applySyncTimeLocked(module string, lastTime int64) {
 	switch module {
 	case "note":
 		if lastTime > s.st.NoteSyncTime {
@@ -540,6 +559,18 @@ func pathHashPayload(rel string) map[string]interface{} {
 		"path":     rel,
 		"pathHash": h.Path(rel),
 	}
+}
+
+// markNoteAddressed records that the server acted on path in the current round.
+func (s *SyncService) markNoteAddressed(path string) {
+	if path == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.roundNoteAddressed != nil {
+		s.roundNoteAddressed[path] = struct{}{}
+	}
+	s.mu.Unlock()
 }
 
 func (s *SyncService) setPendingNoteModify(rel, contentHash string) {

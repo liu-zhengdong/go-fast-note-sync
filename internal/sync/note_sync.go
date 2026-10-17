@@ -37,7 +37,9 @@ func handleNoteSyncEnd(data json.RawMessage, s *SyncService) {
 	scanned := s.scannedNoteHashes
 	s.scannedNoteHashes = make(map[string]state.FileHashEntry)
 
-	if syncData.LastTime > s.st.NoteSyncTime {
+	if s.isSyncing {
+		s.holdRoundSyncTimeLocked("note", syncData.LastTime)
+	} else if syncData.LastTime > s.st.NoteSyncTime {
 		s.st.NoteSyncTime = syncData.LastTime
 	}
 	s.mu.Unlock()
@@ -70,6 +72,7 @@ func handleNoteSyncModify(data json.RawMessage, s *SyncService) {
 		s.incrementCompleted("note")
 		return
 	}
+	s.markNoteAddressed(msg.Path)
 	defer s.incrementCompletedPage("note", msg.PageIndex)
 
 	rp, err := s.resolveVaultPath(msg.Path)
@@ -123,6 +126,7 @@ func handleNoteSyncNeedPush(data json.RawMessage, s *SyncService) {
 		s.incrementCompletedPage("note", msg.PageIndex)
 		return
 	}
+	s.markNoteAddressed(msg.Path)
 	s.updateSyncTime("note", msg.LastTime)
 	rp, err := s.resolveVaultPath(msg.Path)
 	if err != nil || s.cfg.ReadOnlySyncEnabled || s.isVaultFileExcluded(msg.Path) || !strings.HasSuffix(strings.ToLower(msg.Path), ".md") {
@@ -148,6 +152,7 @@ func handleNoteSyncMtime(data json.RawMessage, s *SyncService) {
 		s.incrementCompleted("note")
 		return
 	}
+	s.markNoteAddressed(msg.Path)
 	defer s.incrementCompletedPage("note", msg.PageIndex)
 	s.updateSyncTime("note", msg.LastTime)
 	rp, err := s.resolveVaultPath(msg.Path)
@@ -184,6 +189,7 @@ func handleNoteSyncDelete(data json.RawMessage, s *SyncService) {
 		s.incrementCompleted("note")
 		return
 	}
+	s.markNoteAddressed(msg.Path)
 	defer s.incrementCompletedPage("note", msg.PageIndex)
 	s.updateSyncTime("note", msg.LastTime)
 	rp, err := s.resolveVaultPath(msg.Path)
@@ -228,6 +234,8 @@ func handleNoteSyncRename(data json.RawMessage, s *SyncService) {
 		s.incrementCompleted("note")
 		return
 	}
+	s.markNoteAddressed(msg.Path)
+	s.markNoteAddressed(msg.OldPath)
 	defer s.incrementCompletedPage("note", msg.PageIndex)
 	s.updateSyncTime("note", msg.LastTime)
 	oldRP, oldErr := s.resolveVaultPath(msg.OldPath)

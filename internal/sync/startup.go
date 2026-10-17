@@ -141,6 +141,9 @@ func (s *SyncService) handleSync(isLoadLastTime bool) {
 	s.folderSyncTasks = SyncTaskCounter{}
 	s.syncPages = make(map[string]*syncPageTracker)
 	s.isSyncRequesting = false
+	s.roundSyncTimes = make(map[string]int64)
+	s.roundNoteSent = make(map[string]string)
+	s.roundNoteAddressed = make(map[string]struct{})
 	s.mu.Unlock()
 
 	// The idle watchdog covers the scan, not only the wait for *SyncEnd.
@@ -274,6 +277,9 @@ func (s *SyncService) sendSyncRequests(roundID uint64, result *scanResult, conte
 		for _, n := range result.notes {
 			s.pendingNoteModifies[n.Path] = n.ContentHash
 			s.st.PendingNoteModifies[n.Path] = n.ContentHash
+			if s.roundNoteSent != nil {
+				s.roundNoteSent[n.Path] = n.ContentHash
+			}
 		}
 		if s.cfg.OfflineDeleteSyncEnabled {
 			for _, d := range result.delNotes {
@@ -577,7 +583,22 @@ func (s *SyncService) onSyncComplete(roundID uint64, wasInitSync bool) {
 	s.syncRoundConn = nil
 	pendingOverflow := s.overflowRescanPending
 	s.overflowRescanPending = false
+	held := s.roundSyncTimes
+	sent := s.roundNoteSent
+	addressed := s.roundNoteAddressed
+	s.roundSyncTimes = nil
+	s.roundNoteSent = nil
+	s.roundNoteAddressed = nil
+	for module, t := range held {
+		s.applySyncTimeLocked(module, t)
+	}
 	s.mu.Unlock()
+	if n := s.commitUnaddressedNotes(sent, addressed); n > 0 {
+		log.Printf("[sync] committed %d notes already in sync with server", n)
+	}
+	if err := s.saveState(); err != nil {
+		log.Printf("[sync] save state after round: %v", err)
+	}
 	if !wasInitSync {
 		s.mu.Lock()
 		s.st.IsInitSync = true
@@ -1059,4 +1080,40 @@ func (s *SyncService) saveState() error {
 		return fmt.Errorf("create state dir: %w", mkErr)
 	}
 	return state.WriteFileAtomic(s.statePath, data)
+}
+
+// commitUnaddressedNotes commits notes that were offered to the server this
+// round and that the server did not act on: the server considers them in sync.
+// A note is only committed if it is still pending with the same hash and its
+// on-disk content still matches, so a concurrent local edit stays pending.
+func (s *SyncService) commitUnaddressedNotes(sent map[string]string, addressed map[string]struct{}) int {
+	if len(sent) == 0 || s.cfg.VaultPath == "" || s.cfg.ReadOnlySyncEnabled {
+		return 0
+	}
+	n := 0
+	for path, hash := range sent {
+		if _, ok := addressed[path]; ok {
+			continue
+		}
+		s.mu.Lock()
+		cur, pending := s.pendingNoteModifies[path]
+		s.mu.Unlock()
+		if !pending || cur != hash {
+			continue
+		}
+		abs := filepath.Join(s.cfg.VaultPath, filepath.FromSlash(path))
+		got, mtime, size, err := h.TextFile(abs)
+		if err != nil || got != hash {
+			continue
+		}
+		s.mu.Lock()
+		if cur2, ok := s.pendingNoteModifies[path]; ok && cur2 == hash {
+			s.st.FileHashMap[path] = state.FileHashEntry{Hash: hash, MTime: mtime, Size: size}
+			delete(s.pendingNoteModifies, path)
+			delete(s.st.PendingNoteModifies, path)
+			n++
+		}
+		s.mu.Unlock()
+	}
+	return n
 }
