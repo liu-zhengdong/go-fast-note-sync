@@ -50,6 +50,7 @@ type fakeWSConn struct {
 	writeEvents             []string
 	blockWriteUntilDeadline bool
 	pongHandler             func(string) error
+	pingHandler             func(string) error
 	controlWrites           []controlFrame
 	writeControlErr         error
 	blockOnEmpty            bool
@@ -186,6 +187,23 @@ func (f *fakeWSConn) SetPongHandler(h func(string) error) {
 	f.mu.Lock()
 	f.pongHandler = h
 	f.mu.Unlock()
+}
+
+func (f *fakeWSConn) SetPingHandler(h func(string) error) {
+	f.mu.Lock()
+	f.pingHandler = h
+	f.mu.Unlock()
+}
+
+// TriggerPing simulates a server ping and runs the installed handler.
+func (f *fakeWSConn) TriggerPing(appData string) error {
+	f.mu.Lock()
+	h := f.pingHandler
+	f.mu.Unlock()
+	if h == nil {
+		return fmt.Errorf("no ping handler")
+	}
+	return h(appData)
 }
 
 func (f *fakeWSConn) Written() []string {
@@ -1486,20 +1504,21 @@ func TestHandleClientInfo_Failure(t *testing.T) {
 
 // ---- scheduleReconnect tests ----
 
-func TestScheduleReconnect_MaxAttempts(t *testing.T) {
+func TestScheduleReconnect_MaxAttemptsKeepsRetrying(t *testing.T) {
 	svc := newTestService(nil, nil, "")
 	svc.timeConnect = reconnectMaxAttempts
-	svc.isRegister = true
-	sleepCalled := false
-	svc.sleepFn = func(time.Duration) { sleepCalled = true }
+	svc.isRegister = false
+
+	var sleptFor time.Duration
+	svc.sleepFn = func(d time.Duration) { sleptFor = d }
 
 	svc.scheduleReconnect()
 
-	if sleepCalled {
-		t.Error("sleep should not be called when max attempts exceeded")
+	if sleptFor != reconnectMaxDelay {
+		t.Errorf("sleep duration = %v, want capped %v", sleptFor, reconnectMaxDelay)
 	}
-	if svc.timeConnect != reconnectMaxAttempts+1 {
-		t.Errorf("timeConnect = %d, want %d", svc.timeConnect, reconnectMaxAttempts+1)
+	if svc.timeConnect != reconnectMaxAttempts {
+		t.Errorf("timeConnect = %d, want capped %d", svc.timeConnect, reconnectMaxAttempts)
 	}
 }
 

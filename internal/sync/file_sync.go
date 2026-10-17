@@ -177,7 +177,12 @@ func handleFileSyncUpdate(data json.RawMessage, s *SyncService) {
 	}
 	s.mu.Unlock()
 
-	s.concurrency.WaitForSlot(slotKey, false, -10)
+	if !s.concurrency.WaitForSlot(slotKey, false, -10) {
+		log.Printf("[handler] FileSyncUpdate slot timeout %q", rp.Rel)
+		s.incrementCompleted("file")
+		s.completeSyncPage("file", msg.PageIndex)
+		return
+	}
 
 	if session != nil {
 		s.mu.Lock()
@@ -346,7 +351,16 @@ func handleFileUpload(data json.RawMessage, s *SyncService) {
 	slotHeld := upload.SlotHeld
 	s.mu.Unlock()
 	if !slotHeld {
-		s.concurrency.WaitForSlot(rp.Rel, false, 10)
+		if !s.concurrency.WaitForSlot(rp.Rel, false, 10) {
+			log.Printf("[handler] FileUpload slot timeout %q", rp.Rel)
+			s.mu.Lock()
+			if current := s.activeUploads[rp.Rel]; current == upload && !current.SlotHeld {
+				delete(s.activeUploads, rp.Rel)
+			}
+			s.mu.Unlock()
+			s.incrementCompletedPage("file", msg.PageIndex)
+			return
+		}
 		s.mu.Lock()
 		upload.SlotHeld = true
 		s.mu.Unlock()
@@ -928,7 +942,9 @@ func (s *SyncService) SendFileUploadCheck(raw string) error {
 		payload["baseHashMissing"] = true
 	}
 	s.mu.Unlock()
-	s.concurrency.WaitForSlot(rp.Rel, false, 10)
+	if !s.concurrency.WaitForSlot(rp.Rel, false, 10) {
+		return fmt.Errorf("concurrency slot unavailable for %s", rp.Rel)
+	}
 	if err := s.Send("FileUploadCheck", payload); err != nil {
 		s.concurrency.ReleaseSlot(rp.Rel)
 		return err

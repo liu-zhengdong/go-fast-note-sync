@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	stdsync "sync"
+	"sync/atomic"
 	"time"
 
 	gorillaws "github.com/gorilla/websocket"
@@ -33,10 +35,32 @@ const (
 )
 
 // Keepalive timing vars; var (not const) so tests can override.
+//
+// The service pings every 25s and closes a client that does not pong within
+// 60s (WSPingWait). Proxies on the path often use the same 60s idle timeout
+// and do not always treat an unanswered control frame as traffic. A 20s client
+// ping stays inside both windows with margin for a data write that is holding
+// the socket lock.
 var (
-	pingInterval = 54 * time.Second // ≈ pongWait * 0.6; first ping fires at t≈54s
-	pongWait     = 90 * time.Second // max wall-clock window before conn is judged dead
-	writeWait    = 10 * time.Second // write deadline for ping control frames
+	pingInterval = 20 * time.Second
+	pongWait     = 70 * time.Second // read deadline; refreshed by ping and pong
+	writeWait    = 10 * time.Second // write deadline for data frames and pongs
+
+	// periodicSyncInterval is how often the daemon reconciles even when the
+	// server does not push ClientInfo. The service only broadcasts ClientInfo
+	// from its 10-minute version check, and only when it considers the client
+	// outdated, so that push is not a sync schedule.
+	periodicSyncInterval = 10 * time.Minute
+
+	// slotAcquireTimeout bounds WaitForSlot. The previous implementation blocked
+	// forever, which pinned the read loop or a watcher callback and made
+	// SIGTERM look ignored.
+	slotAcquireTimeout = 60 * time.Second
+
+	// defaultSyncIdleTimeout matches config.SyncTimeoutSeconds == 0. It is an
+	// idle timeout: a round that is still hashing files or receiving pages
+	// does not expire.
+	defaultSyncIdleTimeout = 60 * time.Second
 )
 
 var nonReconnectCloseReasons = map[string]struct{}{
@@ -55,6 +79,7 @@ type WSConn interface {
 	SetReadDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
 	SetPongHandler(h func(appData string) error)
+	SetPingHandler(h func(appData string) error)
 	Close() error
 }
 
@@ -72,11 +97,23 @@ type HTTPDoer interface {
 type gorillaDialer struct{}
 
 func (g *gorillaDialer) Dial(urlStr string, header http.Header) (WSConn, *http.Response, error) {
-	conn, resp, err := gorillaws.DefaultDialer.Dial(urlStr, header)
+	conn, resp, err := wsDialer.Dial(urlStr, header)
 	if err != nil {
 		return nil, resp, err
 	}
 	return conn, resp, nil
+}
+
+// wsDialer enables TCP keepalives. A half-open connection otherwise sits in
+// the kernel until the retransmission timeout, which is long enough to look
+// like a multi-tens-of-minutes silence when the websocket read is also stuck.
+var wsDialer = &gorillaws.Dialer{
+	Proxy:            http.ProxyFromEnvironment,
+	HandshakeTimeout: 45 * time.Second,
+	NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		return d.DialContext(ctx, network, addr)
+	},
 }
 
 // SyncTaskCounter tracks per-module sync task progress.
@@ -122,9 +159,22 @@ type SyncService struct {
 	isSyncRequesting      bool
 	syncRoundID           uint64
 	syncRoundConn         WSConn
+	syncActivity          atomic.Uint64
 	overflowRescanPending bool
 	debugDisconnectAfter  time.Duration
 	debugDisconnectOnce   stdsync.Once
+
+	// beforeCommitScan, when set, runs after a scan decides it still owns the
+	// round and before that result is published. Tests use it to disconnect
+	// in that window.
+	beforeCommitScan func(roundID uint64)
+
+	stopCh       chan struct{}
+	stopOnce     stdsync.Once
+	periodicOnce stdsync.Once
+	// periodicInterval overrides periodicSyncInterval in tests. Zero uses the
+	// package default.
+	periodicInterval time.Duration
 
 	binaryHandlers  map[string]func([]byte)
 	receiveHandlers map[string]func(json.RawMessage, *SyncService)
@@ -228,6 +278,7 @@ func NewSyncService(cfg *config.Config, st *state.State, statePath, version stri
 		pathLocks:                make(map[string]chan struct{}),
 		syncPages:                make(map[string]*syncPageTracker),
 		syncDoneCh:               make(chan struct{}),
+		stopCh:                   make(chan struct{}),
 	}
 	if cfg.SyncTimeoutSeconds > 0 {
 		s.syncTimeout = time.Duration(cfg.SyncTimeoutSeconds) * time.Second
@@ -352,12 +403,72 @@ func reconnectDelay(attempt int) time.Duration {
 	return delay
 }
 
-// Connect starts the connection lifecycle in a goroutine.
+// Connect starts the connection lifecycle and the periodic reconciler.
+// The reconciler is tied to the process, not to one socket, so a reconnect
+// does not cancel the next round.
 func (s *SyncService) Connect() {
 	s.mu.Lock()
 	s.isRegister = true
 	s.mu.Unlock()
+	s.periodicOnce.Do(func() { go s.periodicSyncLoop() })
 	go s.connectOnce()
+}
+
+// Close stops reconnects, abandons any in-flight round, and closes the socket
+// so a blocked read or watcher callback can return. Safe to call more than once.
+func (s *SyncService) Close() error {
+	s.mu.Lock()
+	s.isRegister = false
+	s.abandonActiveSyncLocked("shutdown")
+	s.isOpen = false
+	s.isAuth = false
+	conn := s.conn
+	s.mu.Unlock()
+	if s.concurrency != nil {
+		s.concurrency.Stop()
+	}
+	s.closeStop()
+	if conn != nil {
+		_ = conn.Close()
+	}
+	return nil
+}
+
+func (s *SyncService) closeStop() {
+	s.stopOnce.Do(func() {
+		if s.stopCh == nil {
+			s.stopCh = make(chan struct{})
+		}
+		close(s.stopCh)
+	})
+}
+
+func (s *SyncService) periodicSyncLoop() {
+	interval := s.periodicInterval
+	if interval <= 0 {
+		interval = periodicSyncInterval
+	}
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			ready := s.isRegister && s.isOpen && s.isAuth && s.cfg != nil && !s.cfg.ManualSyncEnabled
+			loadLast := s.st != nil && s.st.IsInitSync
+			s.mu.Unlock()
+			if !ready {
+				continue
+			}
+			log.Printf("[sync] periodic sync")
+			s.handleSync(loadLast)
+		}
+	}
 }
 
 // connectOnce performs one full connection attempt: health check → dial → read loop.
@@ -393,12 +504,9 @@ func (s *SyncService) connectOnce() {
 	}
 
 	// Set up keepalive on the local conn before handing it to readLoop.
-	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+	if err := installKeepalive(conn); err != nil {
 		log.Printf("[ws] set read deadline: %v", err)
 	}
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(pongWait))
-	})
 	done := make(chan struct{})
 	s.pingWG.Add(1)
 	go s.pingLoop(conn, done)
@@ -422,8 +530,11 @@ func (s *SyncService) connectOnce() {
 	s.mu.Lock()
 	s.isOpen = false
 	s.isAuth = false
-	s.isSyncing = false
-	s.isSyncRequesting = false
+	// Bump the round id as well as the flag. Clearing the bool alone lets a
+	// scan that already passed its ownership check publish isSyncRequesting
+	// again after the next round has moved on, and every later ClientInfo
+	// then logs "already syncing" until the process is restarted.
+	s.abandonActiveSyncLocked("disconnect")
 	s.mu.Unlock()
 
 	if nonReconnectCloseReason(closeReason) {
@@ -537,21 +648,78 @@ func nonReconnectCloseReason(reason string) bool {
 }
 
 // scheduleReconnect waits for the exponential backoff delay then retries.
+// After the capped attempt it keeps retrying at the max delay. Stopping for
+// good left a long-running daemon idle until an external restart.
 func (s *SyncService) scheduleReconnect() {
+	s.mu.Lock()
 	s.timeConnect++
 	if s.timeConnect > reconnectMaxAttempts {
-		log.Printf("[ws] max reconnect attempts (%d) reached, giving up", reconnectMaxAttempts)
+		s.timeConnect = reconnectMaxAttempts
+	}
+	attempt := s.timeConnect
+	s.mu.Unlock()
+	delay := reconnectDelay(attempt)
+	log.Printf("[ws] reconnecting in %v (attempt %d/%d)", delay, attempt, reconnectMaxAttempts)
+	if !s.waitReconnect(delay) {
+		log.Printf("[ws] reconnect cancelled by shutdown")
 		return
 	}
-	delay := reconnectDelay(s.timeConnect)
-	log.Printf("[ws] reconnecting in %v (attempt %d/%d)", delay, s.timeConnect, reconnectMaxAttempts)
-	s.sleepFn(delay)
 	s.mu.Lock()
 	shouldReconnect := s.isRegister
 	s.mu.Unlock()
 	if shouldReconnect {
 		s.connectOnce()
 	}
+}
+
+// waitReconnect pauses before the next dial. Closing stopCh (SIGTERM/SIGINT)
+// returns immediately so a long backoff cannot keep the process alive.
+func (s *SyncService) waitReconnect(delay time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		if s.sleepFn != nil {
+			s.sleepFn(delay)
+		} else {
+			time.Sleep(delay)
+		}
+		close(done)
+	}()
+	select {
+	case <-s.stopCh:
+		return false
+	case <-done:
+		return true
+	}
+}
+
+// installKeepalive arms the read deadline and ping/pong handlers.
+//
+// gorilla's default ping handler writes the pong with a 1s deadline while the
+// read loop is inside ReadMessage. A data write that holds the socket lock
+// longer than that — a multi-megabyte NoteSync easily can — fails the pong,
+// fails the read, and the service then closes the TCP connection with no
+// close frame (client log: close 1006 unexpected EOF) because its own ping
+// was not answered within 60s. This handler uses writeWait and treats an
+// incoming ping as liveness, same as a pong.
+func installKeepalive(conn WSConn) error {
+	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return err
+	}
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	conn.SetPingHandler(func(appData string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+			return err
+		}
+		err := conn.WriteControl(gorillaws.PongMessage, []byte(appData), time.Now().Add(writeWait))
+		if err == nil || errors.Is(err, gorillaws.ErrCloseSent) {
+			return nil
+		}
+		log.Printf("[ws] pong write: %v", err)
+		return err
+	})
+	return nil
 }
 
 // pingLoop sends periodic WebSocket ping control frames until done is closed.

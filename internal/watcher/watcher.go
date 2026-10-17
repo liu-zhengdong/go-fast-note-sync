@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -152,9 +153,30 @@ func (w *Watcher) Close() error {
 		w.mu.Unlock()
 		w.cancel()
 		err = w.backend.Close()
-		w.wg.Wait()
+		if !waitGroupTimeout(&w.wg, watcherCloseTimeout) {
+			log.Printf("[watcher] close timed out after %v; continuing shutdown", watcherCloseTimeout)
+			if err == nil {
+				err = fmt.Errorf("watcher close timed out after %v", watcherCloseTimeout)
+			}
+		}
 	})
 	return err
+}
+
+const watcherCloseTimeout = 5 * time.Second
+
+func waitGroupTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (w *Watcher) loop() {

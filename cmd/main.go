@@ -17,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var cliVersion = "dev"
+var cliVersion = "1.1.4"
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
@@ -41,15 +41,20 @@ func newRootCmd() *cobra.Command {
 }
 
 // waitForSignal blocks until a termination signal arrives. Overridden in tests.
+// signal.Stop restores the default disposition so a second SIGTERM/SIGINT
+// kills the process if shutdown itself gets stuck.
 var waitForSignal = func() os.Signal {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	return <-sigCh
+	sig := <-sigCh
+	signal.Stop(sigCh)
+	return sig
 }
 
 type syncDaemon interface {
 	local.Handler
 	Connect()
+	Close() error
 	SyncComplete() <-chan struct{}
 	SyncError() error
 	SetDebugDisconnectAfter(time.Duration)
@@ -102,12 +107,17 @@ func newStartCmd() *cobra.Command {
 				}
 			}
 			sig := waitForSignal()
+			fmt.Fprintf(cmd.ErrOrStderr(), "received %s, shutting down\n", sig)
+			// Close the sync service first so a watcher callback blocked in a
+			// slot or path lock is released before Watcher.Close waits for it.
+			if err := svc.Close(); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "stop sync: %v\n", err)
+			}
 			if w != nil {
 				if err := w.Close(); err != nil {
-					return fmt.Errorf("stop watcher after %s: %w", sig, err)
+					fmt.Fprintf(cmd.ErrOrStderr(), "stop watcher: %v\n", err)
 				}
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "received %s, exiting\n", sig)
 			return nil
 		},
 	}

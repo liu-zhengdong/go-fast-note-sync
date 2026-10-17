@@ -49,12 +49,11 @@ type Config struct {
 	AutoRedirectEnabled bool   `yaml:"auto_redirect_enabled" mapstructure:"auto_redirect_enabled"`
 	StateFile           string `yaml:"state_file"            mapstructure:"state_file"`
 
-	// SyncTimeoutSeconds bounds how long a sync round waits for all
-	// *SyncEnd handlers + acks before force-completing. Defaults to 60s in
-	// the daemon (`internal/sync.runCheckSyncCompletion`); set higher when
-	// the vault is large enough that a fresh client cannot consume the
-	// server's initial-sync payload within the default window. 0 keeps the
-	// 60s default.
+	// SyncTimeoutSeconds is the idle timeout for one sync round, including the
+	// vault scan. The round is abandoned when no scan progress, task counter,
+	// page, or transfer changes within this window. Defaults to 60s. Set
+	// higher when a single file can take longer than that to hash or transfer.
+	// 0 keeps the 60s default.
 	SyncTimeoutSeconds int `yaml:"sync_timeout_seconds" mapstructure:"sync_timeout_seconds"`
 }
 

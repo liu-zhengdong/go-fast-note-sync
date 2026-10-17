@@ -51,7 +51,9 @@ dockers_v2:
       - go-fast-note-sync
     dockerfile: deploy/docker/Dockerfile.goreleaser
     images:
-      - "ghcr.io/erichll/go-fast-note-sync"
+      # This fork publishes under its own GHCR package. Upstream erichll
+      # images are not writable from here.
+      - "ghcr.io/liu-zhengdong/go-fast-note-sync"
     tags:
       - "{{ .Tag }}"
       - latest

@@ -15,12 +15,12 @@ Run `go-fast-note-sync` as a container on a Linux host.
 The published image is available from GitHub Container Registry and is public — no login required:
 
 ```bash
-docker pull ghcr.io/erichll/go-fast-note-sync:latest
+docker pull ghcr.io/liu-zhengdong/go-fast-note-sync:latest
 # or a specific release tag:
-docker pull ghcr.io/erichll/go-fast-note-sync:v1.1.3
+docker pull ghcr.io/liu-zhengdong/go-fast-note-sync:v1.1.4
 ```
 
-Use `ghcr.io/erichll/go-fast-note-sync:<tag>` wherever the image is referenced in Compose or Kubernetes configs.
+Use `ghcr.io/liu-zhengdong/go-fast-note-sync:<tag>` wherever the image is referenced in Compose or Kubernetes configs.
 
 > **Architecture:** published images are **linux/amd64 only**, for both release tags and the rolling `main`/`sha-*` tags. They do not run natively on arm64 hosts (including Apple Silicon Docker Desktop without emulation). On those hosts use Option B to build locally.
 
@@ -30,9 +30,9 @@ as stabilization-tested as a tagged release. Use it when you need a fix that
 landed on main but has not been cut as a release yet:
 
 ```bash
-docker pull ghcr.io/erichll/go-fast-note-sync:main
+docker pull ghcr.io/liu-zhengdong/go-fast-note-sync:main
 # or pin a specific commit:
-docker pull ghcr.io/erichll/go-fast-note-sync:sha-abc1234
+docker pull ghcr.io/liu-zhengdong/go-fast-note-sync:sha-abc1234
 ```
 
 The `main` image reports its commit via `go-fast-note-sync --version`
