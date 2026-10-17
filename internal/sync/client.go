@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,7 +25,7 @@ import (
 
 const (
 	reconnectBaseDelay   = 1000 * time.Millisecond
-	reconnectMaxDelay    = 30 * time.Minute
+	reconnectMaxDelay    = 60 * time.Second
 	reconnectMaxAttempts = 15
 	healthCheckTimeout   = 10 * time.Second
 
@@ -191,6 +192,16 @@ type SyncService struct {
 	pendingNoteModifies   map[string]string
 	pendingUploadHashes   map[string]string
 	pendingConfigModifies map[string]string
+
+	// Round-scoped bookkeeping so a dropped round never loses or redoes work.
+	// roundSyncTimes holds lastTime values seen during an in-flight round; they
+	// are only persisted when the round completes, so a reconnect cannot skip
+	// server pages that were never processed. roundNoteSent/roundNoteAddressed
+	// let a completed round commit notes the server left untouched (already in
+	// sync), instead of keeping them pending and re-sending them forever.
+	roundSyncTimes     map[string]int64
+	roundNoteSent      map[string]string
+	roundNoteAddressed map[string]struct{}
 
 	// pending delete sets (cleared after corresponding SyncEnd)
 	pendingNoteDeleteAcks    map[string]struct{}
@@ -385,6 +396,15 @@ func systemLocale() string {
 
 // reconnectDelay returns the backoff delay for the n-th reconnect attempt (1-based).
 // Formula: 1s, 1s, 1s, 2s, 4s..., capped at 30m.
+// withJitter adds up to +25% random jitter so many clients (or rapid drops)
+// do not reconnect in lockstep.
+func withJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int63n(int64(d)/4+1))
+}
+
 func reconnectDelay(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -536,6 +556,10 @@ func (s *SyncService) connectOnce() {
 	// then logs "already syncing" until the process is restarted.
 	s.abandonActiveSyncLocked("disconnect")
 	s.mu.Unlock()
+	// Acks for in-flight pushes on the dead socket will never arrive; free
+	// their slots so the next round is not starved ("concurrency slot
+	// unavailable"). The paths stay pending and are re-sent next round.
+	s.concurrency.Clear()
 
 	if nonReconnectCloseReason(closeReason) {
 		s.mu.Lock()
@@ -658,7 +682,7 @@ func (s *SyncService) scheduleReconnect() {
 	}
 	attempt := s.timeConnect
 	s.mu.Unlock()
-	delay := reconnectDelay(attempt)
+	delay := withJitter(reconnectDelay(attempt))
 	log.Printf("[ws] reconnecting in %v (attempt %d/%d)", delay, attempt, reconnectMaxAttempts)
 	if !s.waitReconnect(delay) {
 		log.Printf("[ws] reconnect cancelled by shutdown")
