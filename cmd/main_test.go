@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -481,5 +482,52 @@ func TestInitConfigExistingFile(t *testing.T) {
 	cmd2.SilenceUsage = true
 	if err := cmd2.Execute(); err == nil {
 		t.Error("expected error when config already exists")
+	}
+}
+
+type fatalDaemon struct {
+	fakeDaemon
+	fatal chan error
+}
+
+func (f *fatalDaemon) Fatal() <-chan error { return f.fatal }
+
+// The in-process watchdog asks to exit when it cannot recover; start must
+// shut down cleanly and return an error so the process exits non-zero and
+// the supervisor restarts it.
+func TestStartExitsNonZeroOnWatchdogFatal(t *testing.T) {
+	origWait := waitForSignal
+	origSync := newSyncDaemon
+	release := make(chan struct{})
+	defer func() {
+		close(release)
+		waitForSignal = origWait
+		newSyncDaemon = origSync
+	}()
+	waitForSignal = func() os.Signal { <-release; return syscall.SIGTERM }
+	d := &fatalDaemon{fatal: make(chan error, 1)}
+	d.fatal <- fmt.Errorf("no completed sync round")
+	newSyncDaemon = func(_ *config.Config, _ *state.State, _, _ string) syncDaemon { return d }
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := execCmd("init-config", "--config", cfgPath); err != nil {
+		t.Fatalf("init-config: %v", err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := strings.Replace(string(data), "state_file: \"\"", "state_file: "+strconv.Quote(filepath.Join(dir, "state.json")), 1)
+	if err := os.WriteFile(cfgPath, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = execCmd("start", "--config", cfgPath)
+	if err == nil || !strings.Contains(err.Error(), "watchdog") {
+		t.Fatalf("start error = %v, want watchdog error", err)
+	}
+	if !d.closed {
+		t.Fatal("daemon was not closed before exiting")
 	}
 }

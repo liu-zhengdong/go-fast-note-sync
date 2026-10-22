@@ -25,12 +25,28 @@ const pathLockTimeout = 30 * time.Second
 
 // ConcurrencyManager limits local upload-style operations and provides one FIFO
 // lane for rename operations whose Ack does not carry a path.
+//
+// A slot is a lease: it is normally returned by the matching Ack, but an Ack
+// that never arrives on a live socket (the server answered with a different
+// message, or dropped the request) used to pin the slot until the process
+// restarted. Every later push then logged "concurrency slot acquire timed out"
+// and the round stalled. Leases older than slotLeaseTimeout are reclaimed so
+// the limiter degrades to "a little more concurrency" instead of "no sync".
 type ConcurrencyManager struct {
 	enabled  bool
-	slots    chan struct{}
-	fifo     chan struct{}
+	max      int
+	mu       sync.Mutex
+	slots    []time.Time // acquire time of each held slot, oldest first
+	fifo     []time.Time // at most one entry
+	notify   chan struct{}
 	stop     chan struct{}
 	stopOnce sync.Once
+	now      func() time.Time
+
+	// copied from the package defaults at construction; tests override
+	leaseTimeout   time.Duration
+	pollInterval   time.Duration
+	acquireTimeout time.Duration
 }
 
 func NewConcurrencyManager(cfg *config.Config) *ConcurrencyManager {
@@ -45,9 +61,14 @@ func NewConcurrencyManager(cfg *config.Config) *ConcurrencyManager {
 	}
 	return &ConcurrencyManager{
 		enabled: enabled,
-		slots:   make(chan struct{}, max),
-		fifo:    make(chan struct{}, 1),
+		max:     max,
+		notify:  make(chan struct{}, 1),
 		stop:    make(chan struct{}),
+		now:     time.Now,
+
+		leaseTimeout:   slotLeaseTimeout,
+		pollInterval:   slotPollInterval,
+		acquireTimeout: slotAcquireTimeout,
 	}
 }
 
@@ -59,24 +80,77 @@ func (m *ConcurrencyManager) Stop() {
 	m.stopOnce.Do(func() { close(m.stop) })
 }
 
+func (m *ConcurrencyManager) wake() {
+	select {
+	case m.notify <- struct{}{}:
+	default:
+	}
+}
+
+// reclaimStaleLocked drops leases older than slotLeaseTimeout. m.mu must be held.
+func (m *ConcurrencyManager) reclaimStaleLocked() {
+	now := m.now()
+	for len(m.slots) > 0 && now.Sub(m.slots[0]) >= m.leaseTimeout {
+		log.Printf("[sync] reclaimed concurrency slot held for %v without an ack", now.Sub(m.slots[0]).Round(time.Second))
+		m.slots = m.slots[1:]
+	}
+	if len(m.fifo) > 0 && now.Sub(m.fifo[0]) >= m.leaseTimeout {
+		log.Printf("[sync] reclaimed rename slot held for %v without an ack", now.Sub(m.fifo[0]).Round(time.Second))
+		m.fifo = m.fifo[:0]
+	}
+}
+
+func (m *ConcurrencyManager) tryAcquire(fifo bool) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reclaimStaleLocked()
+	if fifo {
+		if len(m.fifo) == 0 {
+			m.fifo = append(m.fifo, m.now())
+			return true
+		}
+		return false
+	}
+	if len(m.slots) < m.max {
+		m.slots = append(m.slots, m.now())
+		return true
+	}
+	return false
+}
+
+// HeldSlots reports the number of held upload slots and rename slots.
+func (m *ConcurrencyManager) HeldSlots() (int, int) {
+	if m == nil {
+		return 0, 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.slots), len(m.fifo)
+}
+
 func (m *ConcurrencyManager) WaitForSlot(_ string, fifo bool, _ int) bool {
 	if m == nil || !m.enabled {
 		return true
 	}
-	ch := m.slots
-	if fifo {
-		ch = m.fifo
-	}
-	timer := time.NewTimer(slotAcquireTimeout)
+	timer := time.NewTimer(m.acquireTimeout)
 	defer timer.Stop()
-	select {
-	case ch <- struct{}{}:
-		return true
-	case <-timer.C:
-		log.Printf("[sync] concurrency slot acquire timed out after %v", slotAcquireTimeout)
-		return false
-	case <-m.stop:
-		return false
+	// Poll as well as wait for a release so a lease that expires while we
+	// wait is reclaimed without needing another release to wake us.
+	poll := time.NewTicker(m.pollInterval)
+	defer poll.Stop()
+	for {
+		if m.tryAcquire(fifo) {
+			return true
+		}
+		select {
+		case <-m.notify:
+		case <-poll.C:
+		case <-timer.C:
+			log.Printf("[sync] concurrency slot acquire timed out after %v", m.acquireTimeout)
+			return false
+		case <-m.stop:
+			return false
+		}
 	}
 }
 
@@ -84,41 +158,33 @@ func (m *ConcurrencyManager) ReleaseSlot(_ string) {
 	if m == nil || !m.enabled {
 		return
 	}
-	select {
-	case <-m.slots:
-	default:
+	m.mu.Lock()
+	if len(m.slots) > 0 {
+		m.slots = m.slots[1:]
 	}
+	m.mu.Unlock()
+	m.wake()
 }
 
 func (m *ConcurrencyManager) ReleaseFifoSlot() {
 	if m == nil || !m.enabled {
 		return
 	}
-	select {
-	case <-m.fifo:
-	default:
-	}
+	m.mu.Lock()
+	m.fifo = m.fifo[:0]
+	m.mu.Unlock()
+	m.wake()
 }
 
 func (m *ConcurrencyManager) Clear() {
 	if m == nil {
 		return
 	}
-	for {
-		select {
-		case <-m.slots:
-		default:
-			goto fifo
-		}
-	}
-fifo:
-	for {
-		select {
-		case <-m.fifo:
-		default:
-			return
-		}
-	}
+	m.mu.Lock()
+	m.slots = nil
+	m.fifo = nil
+	m.mu.Unlock()
+	m.wake()
 }
 
 type resolvedPath struct {

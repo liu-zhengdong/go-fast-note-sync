@@ -283,10 +283,11 @@ type blockingDialer struct {
 	conn    *fakeWSConn
 	entered chan struct{}
 	release chan struct{}
+	once    stdsync.Once
 }
 
 func (b *blockingDialer) Dial(_ string, _ http.Header) (WSConn, *http.Response, error) {
-	close(b.entered)
+	b.once.Do(func() { close(b.entered) })
 	<-b.release
 	return b.conn, &http.Response{StatusCode: 101}, nil
 }
@@ -385,6 +386,9 @@ func newTestService(cfg *config.Config, st *state.State, statePath string) *Sync
 		pathLocks:                make(map[string]chan struct{}),
 		syncPages:                make(map[string]*syncPageTracker),
 		syncDoneCh:               make(chan struct{}),
+		stopCh:                   make(chan struct{}),
+		kickCh:                   make(chan struct{}, 1),
+		fatalCh:                  make(chan error, 1),
 		// Fast timeouts so background goroutines terminate quickly in tests.
 		syncTimeout:     50 * time.Millisecond,
 		folderWaitPoll:  5 * time.Millisecond,
@@ -1573,7 +1577,7 @@ func TestReconnectDelay_UpstreamPatternAndCap(t *testing.T) {
 	}
 }
 
-func TestNonReconnectCloseReasons(t *testing.T) {
+func TestSlowReconnectCloseReasons(t *testing.T) {
 	for _, reason := range []string{
 		"AuthorizationFaild",
 		"ClientClose",
@@ -1581,16 +1585,19 @@ func TestNonReconnectCloseReasons(t *testing.T) {
 		"TokenRotatedOrRevoked",
 		"broadcast failed",
 	} {
-		if !nonReconnectCloseReason(reason) {
-			t.Errorf("reason %q should be non-reconnect", reason)
+		if !slowReconnectCloseReason(reason) {
+			t.Errorf("reason %q should use slow reconnect", reason)
 		}
 	}
-	if nonReconnectCloseReason("temporary network error") {
-		t.Fatal("temporary network close should remain reconnectable")
+	if slowReconnectCloseReason("temporary network error") {
+		t.Fatal("temporary network close should use the fast backoff")
 	}
 }
 
-func TestConnectOnce_NonReconnectCloseReasonsDisableRegister(t *testing.T) {
+// A policy/auth close used to unregister the service for good, so one
+// transient rejection left the daemon idle until an external restart. It now
+// retries with the slow auth backoff and stays registered.
+func TestConnectOnce_SlowReconnectCloseReasonsKeepRetrying(t *testing.T) {
 	for _, reason := range []string{
 		"AuthorizationFaild",
 		"ClientClose",
@@ -1602,19 +1609,29 @@ func TestConnectOnce_NonReconnectCloseReasonsDisableRegister(t *testing.T) {
 			svc := newTestService(nil, nil, filepath.Join(t.TempDir(), "state.json"))
 			svc.httpDoer = &fakeHTTPDoer{statusCode: 200}
 			svc.isRegister = true
-			sleepCalled := false
-			svc.sleepFn = func(time.Duration) { sleepCalled = true }
+			var slept time.Duration
+			svc.sleepFn = func(d time.Duration) {
+				svc.mu.Lock()
+				slept = d
+				svc.isRegister = false // stop after one scheduled retry
+				svc.mu.Unlock()
+			}
 			svc.dialer = &fakeDialer{conn: &fakeWSConn{
 				messages: []wsMsg{{err: &gorillaws.CloseError{Code: gorillaws.CloseNormalClosure, Text: reason}}},
 			}}
 
 			svc.connectOnce()
 
-			if sleepCalled {
-				t.Fatal("non-reconnect close reason should not schedule reconnect")
+			svc.mu.Lock()
+			defer svc.mu.Unlock()
+			if slept == 0 {
+				t.Fatal("slow close reason should schedule a reconnect")
 			}
-			if svc.isRegister {
-				t.Fatal("non-reconnect close reason should unregister the service")
+			if !withinJitter(slept, authRetryDelay(1)) {
+				t.Fatalf("retry delay = %v, want slow backoff %v (+jitter)", slept, authRetryDelay(1))
+			}
+			if svc.authFailures != 1 {
+				t.Fatalf("authFailures = %d, want 1", svc.authFailures)
 			}
 		})
 	}
@@ -1707,8 +1724,10 @@ func TestConnect_SetsIsRegister(t *testing.T) {
 	if !svc.isRegister {
 		t.Error("Connect should set isRegister=true before launching goroutine")
 	}
+	// ClientClose now schedules a slow retry instead of unregistering; stop
+	// the service so that retry does not outlive the test.
+	_ = svc.Close()
 	close(dialer.release)
-	// Allow the goroutine to finish (it does a health check + dial + read loop)
 	time.Sleep(50 * time.Millisecond)
 }
 

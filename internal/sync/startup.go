@@ -578,6 +578,8 @@ func (s *SyncService) onSyncComplete(roundID uint64, wasInitSync bool) {
 		return
 	}
 	log.Printf("[sync] sync round complete (wasInitSync=%v)", wasInitSync)
+	s.lastHealthy = time.Now()
+	s.watchdogTripped = false
 	s.isSyncing = false
 	s.syncErr = nil
 	s.syncRoundConn = nil

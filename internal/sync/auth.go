@@ -28,15 +28,15 @@ var authErrorReimportCodes = map[int]struct{}{
 }
 
 // handleAuthorization processes the Authorization response.
-// Success range: 1 ≤ code ≤ 299. Failure: code ≤ 0 || code ≥ 300 → log, no reconnect.
+// Success range: 1 ≤ code ≤ 299. Failure: code ≤ 0 || code ≥ 300 → log, close
+// the socket, and retry with slow backoff.
 func handleAuthorization(env Envelope, s *SyncService) {
 	if env.Code <= 0 || env.Code >= 300 {
 		log.Printf("[auth] %s", formatAuthorizationError(env, s.cfg.APIToken))
+		s.onAuthRejected()
 		return
 	}
-	s.mu.Lock()
-	s.isAuth = true
-	s.mu.Unlock()
+	s.onAuthSucceeded()
 	log.Printf("[auth] authorization successful (code=%d)", env.Code)
 	sendClientInfo(s)
 }
