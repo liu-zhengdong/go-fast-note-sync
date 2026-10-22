@@ -62,9 +62,43 @@ var (
 	// idle timeout: a round that is still hashing files or receiving pages
 	// does not expire.
 	defaultSyncIdleTimeout = 60 * time.Second
+
+	// slotLeaseTimeout reclaims a concurrency slot whose Ack never arrived.
+	slotLeaseTimeout = 3 * time.Minute
+	slotPollInterval = time.Second
+
+	// authHandshakeTimeout closes a socket that connected but was never
+	// authorized. Without it a lost or unanswered Authorization reply leaves
+	// the client connected, unauthenticated and silent indefinitely: the
+	// periodic reconciler only runs once isAuth is set.
+	authHandshakeTimeout = 30 * time.Second
+
+	// Slow backoff after the server rejects the token or closes for policy
+	// reasons. These used to stop reconnecting for good, so one transient
+	// rejection (seen: Code=315 "Auth token Scope restricted") left the
+	// daemon idle until an external restart.
+	authRetryBaseDelay = 30 * time.Second
+	authRetryMaxDelay  = 10 * time.Minute
+
+	// watchdogTick is how often the in-process watchdog samples liveness.
+	watchdogTick = 5 * time.Second
+	// watchdogIdle is how long the client may go without a completed sync
+	// round or any sync progress before the watchdog forces a reconnect. A
+	// second idle window after that exits the process so the supervisor
+	// restarts it. Measured on the monotonic clock, so time the host spends
+	// suspended does not count.
+	watchdogIdle = 15 * time.Minute
+	// suspendJumpThreshold: if wall-clock time advances this much more than
+	// monotonic time between two watchdog ticks, the VM/host was paused. The
+	// socket is almost certainly dead by then, so reconnect immediately
+	// instead of waiting out the read deadline and the periodic ticker.
+	suspendJumpThreshold = 30 * time.Second
 )
 
-var nonReconnectCloseReasons = map[string]struct{}{
+// slowReconnectCloseReasons are server close reasons that mean "not now"
+// (bad/rotated token, kicked, policy). The client keeps retrying them with
+// authRetryDelay instead of giving up.
+var slowReconnectCloseReasons = map[string]struct{}{
 	"AuthorizationFaild":    {},
 	"ClientClose":           {},
 	"kicked by admin":       {},
@@ -173,6 +207,22 @@ type SyncService struct {
 	stopCh       chan struct{}
 	stopOnce     stdsync.Once
 	periodicOnce stdsync.Once
+	watchdogOnce stdsync.Once
+
+	// reconnect bookkeeping
+	reconnectAttempts int  // attempts since the last successful auth (for logs)
+	authFailures      int  // consecutive auth/policy rejections
+	authFailed        bool // the current socket got an auth rejection
+	kickCh            chan struct{}
+
+	// watchdog state (guarded by mu)
+	lastHealthy     time.Time
+	watchdogTripped bool
+	fatalCh         chan error
+	fatalOnce       stdsync.Once
+	clockJumpFn     func(prevWall, nowWall time.Time, monoElapsed time.Duration) time.Duration // tests
+	authTimeout     time.Duration                                                              // tests; 0 = authHandshakeTimeout
+	watchdogEvery   time.Duration                                                              // tests; 0 = watchdogTick
 	// periodicInterval overrides periodicSyncInterval in tests. Zero uses the
 	// package default.
 	periodicInterval time.Duration
@@ -290,6 +340,8 @@ func NewSyncService(cfg *config.Config, st *state.State, statePath, version stri
 		syncPages:                make(map[string]*syncPageTracker),
 		syncDoneCh:               make(chan struct{}),
 		stopCh:                   make(chan struct{}),
+		kickCh:                   make(chan struct{}, 1),
+		fatalCh:                  make(chan error, 1),
 	}
 	if cfg.SyncTimeoutSeconds > 0 {
 		s.syncTimeout = time.Duration(cfg.SyncTimeoutSeconds) * time.Second
@@ -301,6 +353,22 @@ func NewSyncService(cfg *config.Config, st *state.State, statePath, version stri
 // SyncComplete returns a channel that is closed once the first sync round completes.
 func (s *SyncService) SyncComplete() <-chan struct{} {
 	return s.syncDoneCh
+}
+
+// Fatal delivers an error when the watchdog decides the process is wedged
+// beyond in-process recovery. The daemon should exit non-zero so its
+// supervisor restarts it.
+func (s *SyncService) Fatal() <-chan error {
+	return s.fatalCh
+}
+
+func (s *SyncService) fail(err error) {
+	s.fatalOnce.Do(func() {
+		log.Printf("[watchdog] fatal: %v", err)
+		if s.fatalCh != nil {
+			s.fatalCh <- err
+		}
+	})
 }
 
 func (s *SyncService) SyncError() error {
@@ -395,7 +463,7 @@ func systemLocale() string {
 }
 
 // reconnectDelay returns the backoff delay for the n-th reconnect attempt (1-based).
-// Formula: 1s, 1s, 1s, 2s, 4s..., capped at 30m.
+// Formula: 1s, 1s, 1s, 2s, 4s..., capped at reconnectMaxDelay.
 // withJitter adds up to +25% random jitter so many clients (or rapid drops)
 // do not reconnect in lockstep.
 func withJitter(d time.Duration) time.Duration {
@@ -423,15 +491,144 @@ func reconnectDelay(attempt int) time.Duration {
 	return delay
 }
 
-// Connect starts the connection lifecycle and the periodic reconciler.
-// The reconciler is tied to the process, not to one socket, so a reconnect
-// does not cancel the next round.
+// authRetryDelay is the slow backoff after an auth/policy rejection:
+// 30s, 1m, 2m, 4m, 8m, then 10m.
+func authRetryDelay(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	shift := failures - 1
+	if shift > 20 {
+		shift = 20
+	}
+	d := authRetryBaseDelay * (1 << uint(shift))
+	if d > authRetryMaxDelay || d <= 0 {
+		return authRetryMaxDelay
+	}
+	return d
+}
+
+// Connect starts the connection lifecycle, the periodic reconciler and the
+// watchdog. Both loops are tied to the process, not to one socket, so a
+// reconnect does not cancel the next round.
 func (s *SyncService) Connect() {
 	s.mu.Lock()
 	s.isRegister = true
+	s.lastHealthy = time.Now()
 	s.mu.Unlock()
 	s.periodicOnce.Do(func() { go s.periodicSyncLoop() })
+	s.watchdogOnce.Do(func() { go s.watchdogLoop() })
 	go s.connectOnce()
+}
+
+// markHealthy records that sync is making progress.
+func (s *SyncService) markHealthy() {
+	s.mu.Lock()
+	s.lastHealthy = time.Now()
+	s.watchdogTripped = false
+	s.mu.Unlock()
+}
+
+// forceReconnect drops the current socket (readLoop then unwinds into the
+// normal reconnect path, which also abandons the in-flight round and frees
+// concurrency slots) or, when no socket is up, cuts the backoff wait short.
+func (s *SyncService) forceReconnect(reason string) {
+	s.mu.Lock()
+	conn := s.conn
+	s.timeConnect = 0
+	s.mu.Unlock()
+	if conn != nil {
+		log.Printf("[ws] forcing reconnect (%s)", reason)
+		_ = conn.Close()
+		return
+	}
+	if s.kickCh != nil {
+		select {
+		case s.kickCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// watchdogLoop is the in-process liveness monitor. See watchdogIdle and
+// suspendJumpThreshold.
+func (s *SyncService) watchdogLoop() {
+	every := s.watchdogEvery
+	if every <= 0 {
+		every = watchdogTick
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	lastMono := time.Now()
+	lastWall := lastMono.Round(0)
+	lastProgress := s.syncProgressSnapshot()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+		nowMono := time.Now()
+		nowWall := nowMono.Round(0) // strip monotonic reading: wall-clock delta
+		jumpFn := s.clockJumpFn
+		if jumpFn == nil {
+			jumpFn = clockJump
+		}
+		jump := jumpFn(lastWall, nowWall, nowMono.Sub(lastMono))
+		lastMono, lastWall = nowMono, nowWall
+		if jump > suspendJumpThreshold {
+			log.Printf("[watchdog] wall clock moved %v more than monotonic time (host was suspended); reconnecting now", jump.Round(time.Second))
+			s.forceReconnect("resume after suspend")
+			continue
+		}
+		if p := s.syncProgressSnapshot(); p != lastProgress {
+			lastProgress = p
+			s.markHealthy()
+		}
+		s.checkWedged(nowMono)
+	}
+}
+
+// clockJump returns how much further the wall clock moved than the monotonic
+// clock. Linux CLOCK_MONOTONIC does not advance while a VM is paused, but the
+// wall clock is corrected on resume, so a large positive value means the host
+// was suspended.
+func clockJump(prevWall, nowWall time.Time, monoElapsed time.Duration) time.Duration {
+	return nowWall.Round(0).Sub(prevWall.Round(0)) - monoElapsed
+}
+
+// checkWedged trips the watchdog when no sync round has completed and no
+// sync progress was seen for watchdogIdle: first by forcing a reconnect,
+// then, if a further idle window passes, by asking the process to exit.
+func (s *SyncService) checkWedged(now time.Time) {
+	s.mu.Lock()
+	if !s.isRegister || s.lastHealthy.IsZero() {
+		s.mu.Unlock()
+		return
+	}
+	if s.cfg != nil && s.cfg.ManualSyncEnabled && s.isOpen && s.isAuth {
+		// Manual mode never runs rounds on its own; an authorized socket is
+		// the best available liveness signal.
+		s.lastHealthy = now
+		s.watchdogTripped = false
+		s.mu.Unlock()
+		return
+	}
+	idle := now.Sub(s.lastHealthy)
+	if idle < watchdogIdle {
+		s.mu.Unlock()
+		return
+	}
+	tripped := s.watchdogTripped
+	s.watchdogTripped = true
+	s.lastHealthy = now
+	s.mu.Unlock()
+	if !tripped {
+		log.Printf("[watchdog] no completed sync round or sync progress for %v; forcing reconnect", idle.Round(time.Second))
+		s.forceReconnect("watchdog")
+		return
+	}
+	s.fail(fmt.Errorf("no completed sync round for %v after a forced reconnect", idle.Round(time.Second)))
 }
 
 // Close stops reconnects, abandons any in-flight round, and closes the socket
@@ -543,6 +740,7 @@ func (s *SyncService) connectOnce() {
 	if err := s.Send("Authorization", s.cfg.APIToken); err != nil {
 		log.Printf("[ws] failed to send Authorization: %v", err)
 	}
+	go s.watchAuthDeadline(conn, done)
 
 	closeReason := s.readLoop()
 	close(done)
@@ -561,18 +759,69 @@ func (s *SyncService) connectOnce() {
 	// unavailable"). The paths stay pending and are re-sent next round.
 	s.concurrency.Clear()
 
-	if nonReconnectCloseReason(closeReason) {
-		s.mu.Lock()
-		s.isRegister = false
-		s.mu.Unlock()
-		return
-	}
 	s.mu.Lock()
+	slow := s.authFailed || slowReconnectCloseReason(closeReason)
+	s.authFailed = false
 	shouldReconnect := s.isRegister
 	s.mu.Unlock()
-	if shouldReconnect {
-		s.scheduleReconnect()
+	if !shouldReconnect {
+		return
 	}
+	if slow {
+		log.Printf("[ws] server refused the session (reason=%q); retrying with slow backoff", closeReason)
+	}
+	s.scheduleReconnectWith(slow)
+}
+
+// watchAuthDeadline closes conn if it is still unauthorized after
+// authHandshakeTimeout.
+func (s *SyncService) watchAuthDeadline(conn WSConn, done <-chan struct{}) {
+	timeout := s.authTimeout
+	if timeout <= 0 {
+		timeout = authHandshakeTimeout
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-done:
+		return
+	case <-s.stopCh:
+		return
+	case <-t.C:
+	}
+	s.mu.Lock()
+	stale := s.conn == conn && s.isOpen && !s.isAuth
+	if stale {
+		s.authFailed = true
+	}
+	s.mu.Unlock()
+	if stale {
+		log.Printf("[ws] not authorized within %v; closing connection", timeout)
+		_ = conn.Close()
+	}
+}
+
+// onAuthRejected closes the socket after the server rejected Authorization so
+// the reconnect loop retries with slow backoff, instead of sitting on a
+// connected but unauthenticated socket.
+func (s *SyncService) onAuthRejected() {
+	s.mu.Lock()
+	s.authFailed = true
+	conn := s.conn
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// onAuthSucceeded resets backoff state after a successful Authorization.
+func (s *SyncService) onAuthSucceeded() {
+	s.mu.Lock()
+	s.isAuth = true
+	s.authFailures = 0
+	s.authFailed = false
+	s.reconnectAttempts = 0
+	s.mu.Unlock()
 }
 
 // checkHealth performs GET /api/health.
@@ -666,24 +915,39 @@ func extractWSCloseReason(err error) string {
 	return ""
 }
 
-func nonReconnectCloseReason(reason string) bool {
-	_, ok := nonReconnectCloseReasons[reason]
+func slowReconnectCloseReason(reason string) bool {
+	_, ok := slowReconnectCloseReasons[reason]
 	return ok
 }
 
 // scheduleReconnect waits for the exponential backoff delay then retries.
-// After the capped attempt it keeps retrying at the max delay. Stopping for
-// good left a long-running daemon idle until an external restart.
 func (s *SyncService) scheduleReconnect() {
+	s.scheduleReconnectWith(false)
+}
+
+// scheduleReconnectWith waits for the backoff delay then starts the next
+// attempt. It never gives up: network failures back off to reconnectMaxDelay,
+// auth/policy rejections (slow=true) to authRetryMaxDelay. The next attempt
+// runs on a fresh goroutine so a long-lived daemon does not grow one stack
+// frame pair per reconnect.
+func (s *SyncService) scheduleReconnectWith(slow bool) {
 	s.mu.Lock()
-	s.timeConnect++
-	if s.timeConnect > reconnectMaxAttempts {
-		s.timeConnect = reconnectMaxAttempts
+	var delay time.Duration
+	if slow {
+		s.authFailures++
+		delay = authRetryDelay(s.authFailures)
+	} else {
+		s.timeConnect++
+		if s.timeConnect > reconnectMaxAttempts {
+			s.timeConnect = reconnectMaxAttempts
+		}
+		delay = reconnectDelay(s.timeConnect)
 	}
-	attempt := s.timeConnect
+	s.reconnectAttempts++
+	attempt := s.reconnectAttempts
 	s.mu.Unlock()
-	delay := withJitter(reconnectDelay(attempt))
-	log.Printf("[ws] reconnecting in %v (attempt %d/%d)", delay, attempt, reconnectMaxAttempts)
+	delay = withJitter(delay)
+	log.Printf("[ws] reconnecting in %v (attempt %d)", delay.Round(time.Millisecond), attempt)
 	if !s.waitReconnect(delay) {
 		log.Printf("[ws] reconnect cancelled by shutdown")
 		return
@@ -692,7 +956,7 @@ func (s *SyncService) scheduleReconnect() {
 	shouldReconnect := s.isRegister
 	s.mu.Unlock()
 	if shouldReconnect {
-		s.connectOnce()
+		go s.connectOnce()
 	}
 }
 
@@ -712,6 +976,9 @@ func (s *SyncService) waitReconnect(delay time.Duration) bool {
 	case <-s.stopCh:
 		return false
 	case <-done:
+		return true
+	case <-s.kickCh:
+		log.Printf("[ws] reconnect wait cut short")
 		return true
 	}
 }

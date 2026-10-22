@@ -106,8 +106,23 @@ func newStartCmd() *cobra.Command {
 					return fmt.Errorf("start watcher: %w", err)
 				}
 			}
-			sig := waitForSignal()
-			fmt.Fprintf(cmd.ErrOrStderr(), "received %s, shutting down\n", sig)
+			var fatal <-chan error
+			if f, ok := svc.(interface{ Fatal() <-chan error }); ok {
+				fatal = f.Fatal()
+			}
+			sigCh := make(chan os.Signal, 1)
+			wait := waitForSignal
+			go func() { sigCh <- wait() }()
+			var exitErr error
+			select {
+			case sig := <-sigCh:
+				fmt.Fprintf(cmd.ErrOrStderr(), "received %s, shutting down\n", sig)
+			case err := <-fatal:
+				// The in-process watchdog could not recover. Exit non-zero so
+				// systemd/fns-supervise restarts the daemon from scratch.
+				fmt.Fprintf(cmd.ErrOrStderr(), "watchdog: %v; exiting for restart\n", err)
+				exitErr = fmt.Errorf("watchdog: %w", err)
+			}
 			// Close the sync service first so a watcher callback blocked in a
 			// slot or path lock is released before Watcher.Close waits for it.
 			if err := svc.Close(); err != nil {
@@ -118,7 +133,7 @@ func newStartCmd() *cobra.Command {
 					fmt.Fprintf(cmd.ErrOrStderr(), "stop watcher: %v\n", err)
 				}
 			}
-			return nil
+			return exitErr
 		},
 	}
 	cmd.Flags().StringVar(&cfgPath, "config", "", "path to config file (default: ~/.config/go-fast-note-sync/config.yaml)")

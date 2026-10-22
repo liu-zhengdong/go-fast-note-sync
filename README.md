@@ -10,7 +10,7 @@ A Linux/headless Go CLI daemon that syncs a local [Obsidian](https://obsidian.md
 - **Live file watching** — incremental push on local change via fsnotify, with debounce and echo suppression
 - **Binary file chunked transfer** — resumable multi-chunk upload/download with checkpoints
 - **Startup sync** — full vault reconciliation on connect, then incremental deltas
-- **Automatic reconnect** — on-failure reconnect with configurable restart
+- **Automatic reconnect** — never gives up: capped backoff with jitter, slower retry after auth rejections, and an in-process watchdog that reconnects after host suspend or a stalled round and exits non-zero (for `Restart=on-failure`) if it still cannot recover
 - **systemd-ready** — ships a user-service unit file for unattended background operation
 - **Config via YAML** — environment variable expansion (`${VAR}`) supported
 - **Persistent state** — atomic JSON state file; crash-safe pending hashes and upload checkpoints
